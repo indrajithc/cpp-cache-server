@@ -1,11 +1,16 @@
-#include "crow_all.h"
-#include "json.hpp"
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/asio.hpp>
 #include <iostream>
 #include <unordered_map>
 #include <mutex>
 #include <memory>
+#include "json.hpp"
 
 using json = nlohmann::json;
+namespace beast = boost::beast;           
+namespace http = beast::http;             
+namespace net = boost::asio;               
 
 // CacheEntry structure to hold key-value pairs and tags
 struct CacheEntry {
@@ -13,9 +18,7 @@ struct CacheEntry {
     std::string value;
     std::vector<std::string> tags;
 
-    // Default constructor
     CacheEntry() : key(""), value(""), tags({}) {}
-
     CacheEntry(const std::string& k, const std::string& v, const std::vector<std::string>& t)
         : key(k), value(v), tags(t) {}
 };
@@ -57,42 +60,62 @@ private:
     std::mutex mutex_; // Protect shared resource
 };
 
-int main() {
-    // Initialize Crow and the Cache
-    crow::SimpleApp app;
-    auto cache = std::make_shared<Cache>();
-
-    // Endpoint to store cache data
-    CROW_ROUTE(app, "/cache").methods("POST"_method)([cache](const crow::request& req) {
-        auto json_data = json::parse(req.body);
+// Function to handle requests
+void handle_request(Cache& cache, beast::tcp_stream& stream, http::request<http::string_body> req) {
+    http::response<http::string_body> res;
+    if (req.method() == http::verb::post && req.target() == "/cache") {
+        auto json_data = json::parse(req.body());
         CacheEntry entry(json_data["key"], json_data["value"], json_data["tags"].get<std::vector<std::string>>());
-        cache->store(entry);
-        return crow::response(200, "Data stored successfully");
-    });
-
-    // Endpoint to retrieve cache data
-    CROW_ROUTE(app, "/cache/<string>").methods("GET"_method)([cache](const std::string& key) {
-        auto entry = cache->get(key);
+        cache.store(entry);
+        res = http::response<http::string_body>(http::status::ok, req.version());
+        res.set(http::field::content_type, "text/plain");
+        res.body() = "Data stored successfully";
+        res.prepare_payload();
+    } else if (req.method() == http::verb::get && req.target().starts_with("/cache/")) {
+        std::string key = req.target().substr(7); // Remove "/cache/" prefix
+        auto entry = cache.get(key);
         if (entry) {
             json response_json = {
                 {"key", entry->key},
                 {"value", entry->value},
                 {"tags", entry->tags}
             };
-            return crow::response(200, response_json.dump());
+            res = http::response<http::string_body>(http::status::ok, req.version());
+            res.set(http::field::content_type, "application/json");
+            res.body() = response_json.dump();
+            res.prepare_payload();
+        } else {
+            res = http::response<http::string_body>(http::status::not_found, req.version());
+            res.set(http::field::content_type, "text/plain");
+            res.body() = "Key not found";
+            res.prepare_payload();
         }
-        return crow::response(404, "Key not found");
-    });
+    } else {
+        res = http::response<http::string_body>(http::status::bad_request, req.version());
+        res.set(http::field::content_type, "text/plain");
+        res.body() = "Invalid request";
+        res.prepare_payload();
+    }
+    beast::http::write(stream, res);
+}
 
-    // Endpoint to clear cache by tags
-    CROW_ROUTE(app, "/cache/revalidate").methods("POST"_method)([cache](const crow::request& req) {
-        auto json_data = json::parse(req.body);
-        auto tags = json_data["tags"].get<std::vector<std::string>>();
-        cache->clearByTags(tags);
-        return crow::response(200, "Cache cleared successfully");
-    });
+// Main function to run the server
+int main() {
+    try {
+        net::io_context ioc;
+        beast::tcp_acceptor acceptor(ioc, {net::ip::make_address("0.0.0.0"), 5000});
+        Cache cache;
 
-    // Start the server
-    app.port(5000).multithreaded().run();
+        for (;;) {
+            beast::tcp_stream stream(ioc);
+            acceptor.accept(stream);
+            http::request<http::string_body> req;
+            beast::flat_buffer buffer;
+            http::read(stream, buffer, req);
+            handle_request(cache, stream, std::move(req));
+        }
+    } catch (std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
     return 0;
 }
